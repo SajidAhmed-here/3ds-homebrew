@@ -1,37 +1,211 @@
-name: buildroot
+name: CI
 
 on:
   push:
-    branches: [ master ]
   pull_request:
-    branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      full_build:
+        description: Download all upstream assets and build the complete repository
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# spinarak.py uses only the Python standard library. No pip dependencies,
+# repository variables, custom secrets, or deployment credentials are required.
+env:
+  PYTHONUNBUFFERED: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-
+  validate:
+    name: Validate and smoke-test packaging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-    - uses: actions/checkout@v2
-    - name: Set up Python 3.8
-      uses: actions/setup-python@v1
-      with:
-        python-version: 3.8
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
-    - name: Build Repo
-      run: |
-        python3 spinarak.py
-        echo "<html><head> <meta http-equiv='refresh' content='5; URL= http://apps.fortheusers.org/3ds' /></head></html>" > ./public/index.html
-        
-    - name: Upload artifact
-      uses: actions/upload-artifact@v1.0.0
-      with:
-        name: output
-        path: public
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
-    - name: Deploy Repo
-      uses: crazy-max/ghaction-github-pages@v1.4.0
-      with:
-        build_dir: public
-        fqdn: 3ds.apps.fortheusers.org
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate Python, configuration, and all package definitions
+        shell: python
+        run: |
+          import ast
+          import json
+          from pathlib import Path, PurePosixPath
+          from urllib.parse import urlsplit
+
+          root = Path.cwd()
+          for source in root.glob('*.py'):
+              ast.parse(source.read_text(encoding='utf-8'), filename=str(source))
+
+          config = json.loads((root / 'config.json').read_text(encoding='utf-8'))
+          assert isinstance(config['ignored_directories'], list)
+          assert all(isinstance(item, str) for item in config['ignored_directories'])
+          assert isinstance(config['valid_binary_extensions'], list)
+          assert config['valid_binary_extensions']
+          assert all(isinstance(item, str) and item for item in config['valid_binary_extensions'])
+          output = config['output_directory']
+          assert isinstance(output, str) and output
+          output_path = PurePosixPath(output)
+          assert not output_path.is_absolute() and '..' not in output_path.parts
+          assert output_path.parts and not (root / output).exists()
+
+          packages = sorted(root.glob('*/pkgbuild.json'))
+          assert packages, 'No package definitions found'
+          names = set()
+          required = ('category', 'license', 'title', 'url', 'author',
+                      'version', 'details', 'description')
+          file_types = {'update', 'get', 'local', 'extract'}
+
+          def validate_asset(asset, package_dir, nested=False):
+              kind = asset['type']
+              assert kind in file_types | {'icon', 'screenshot', 'zip'}, asset
+              if nested:
+                  assert isinstance(asset['path'], str) and asset['path'], asset
+                  assert '..' not in PurePosixPath(asset['path']).parts, asset
+                  assert kind != 'zip', 'Nested ZIP assets are unsupported'
+              else:
+                  source = asset['url']
+                  assert isinstance(source, str) and source, asset
+                  if urlsplit(source).scheme in ('http', 'https'):
+                      assert urlsplit(source).netloc, asset
+                      assert kind != 'local', asset
+                  else:
+                      local = PurePosixPath(source)
+                      assert not local.is_absolute() and '..' not in local.parts, asset
+                      assert (package_dir / source).is_file(), f'Missing local asset: {package_dir / source}'
+              if kind in file_types:
+                  assert isinstance(asset['dest'], str) and asset['dest'].strip('/'), asset
+                  assert '..' not in PurePosixPath(asset['dest']).parts, asset
+              if kind == 'zip':
+                  assert isinstance(asset['zip'], list) and asset['zip'], asset
+                  for child in asset['zip']:
+                      validate_asset(child, package_dir, nested=True)
+
+          for path in packages:
+              package = json.loads(path.read_text(encoding='utf-8'))
+              name = package['package']
+              assert name == path.parent.name and name not in names, path
+              assert path.parent.name not in config['ignored_directories'], path
+              names.add(name)
+              for field in required:
+                  assert isinstance(package['info'][field], str) and package['info'][field], f'{path}: {field}'
+              assert isinstance(package['assets'], list) and package['assets'], path
+              destinations = set()
+              for asset in package['assets']:
+                  validate_asset(asset, path.parent)
+                  for item in asset.get('zip', [asset]):
+                      if item['type'] in file_types:
+                          destinations.add(item['dest'])
+              binary = package['info'].get('binary')
+              if binary and binary != 'none' and binary not in destinations:
+                  print(f'::warning file={path.as_posix()}::Binary path {binary} does not match an asset destination')
+          print(f'Validated Python syntax, configuration, and {len(packages)} packages')
+
+      - name: Smoke-test local packages without network access
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import zipfile
+
+          root = Path.cwd()
+          # These existing packages exercise local binaries, icons, and screenshots.
+          selected = ('BreadBox', 'FidgetSpinner3DS')
+          with tempfile.TemporaryDirectory() as directory:
+              work = Path(directory)
+              shutil.copy2(root / 'spinarak.py', work)
+              shutil.copy2(root / 'config.json', work)
+              for name in selected:
+                  shutil.copytree(root / name, work / name)
+              # Block accidental downloads rather than relying on upstream availability.
+              command = (
+                  "import runpy, urllib.request; "
+                  "urllib.request.urlopen = lambda *a, **k: "
+                  "(_ for _ in ()).throw(RuntimeError('Network access disabled in smoke test')); "
+                  "runpy.run_path('spinarak.py', run_name='__main__')"
+              )
+              output = work / json.loads((work / 'config.json').read_text())['output_directory']
+              for attempt in range(2):
+                  # The second run also exercises the unchanged-package update path.
+                  subprocess.run([sys.executable, '-c', command], cwd=work, check=True, timeout=120)
+                  repo = json.loads((output / 'repo.json').read_text())
+                  assert {item['name'] for item in repo['packages']} == set(selected)
+                  for name in selected:
+                      package = json.loads((work / name / 'pkgbuild.json').read_text())
+                      with zipfile.ZipFile(output / 'zips' / f'{name}.zip') as archive:
+                          assert archive.testzip() is None, name
+                          assert {'info.json', 'manifest.install'} <= set(archive.namelist()), name
+                          for asset in package['assets']:
+                              if 'dest' in asset:
+                                  assert archive.read(asset['dest'].strip('/')) == (root / name / asset['url']).read_bytes()
+                      assert (output / 'packages' / name / 'icon.png').is_file()
+              assert (output / 'packages' / 'FidgetSpinner3DS' / 'screen.png').is_file()
+          print('Fresh packaging and incremental update smoke tests passed')
+
+  full-build:
+    name: Build all packages from upstream assets
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && inputs.full_build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Build in a temporary copy and verify completeness
+        id: build
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import zipfile
+
+          root = Path.cwd()
+          work = Path(os.environ['RUNNER_TEMP']) / 'full-build'
+          shutil.copytree(root, work, ignore=shutil.ignore_patterns('.git'))
+          subprocess.run([sys.executable, 'spinarak.py'], cwd=work, check=True, timeout=1500)
+          config = json.loads((work / 'config.json').read_text())
+          output = work / config['output_directory']
+          expected = {json.loads(path.read_text())['package'] for path in work.glob('*/pkgbuild.json')}
+          repo = json.loads((output / 'repo.json').read_text())
+          assert {item['name'] for item in repo['packages']} == expected, 'Some packages failed to build'
+          for path in work.glob('*/pkgbuild.json'):
+              with zipfile.ZipFile(output / 'zips' / f'{path.parent.name}.zip') as archive:
+                  assert archive.testzip() is None, path
+                  assert {'info.json', 'manifest.install'} <= set(archive.namelist()), path
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as stream:
+              stream.write(f'directory={output}\n')
+
+      - name: Upload complete repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-repository
+          path: ${{ steps.build.outputs.directory }}
+          if-no-files-found: error
+          retention-days: 7
